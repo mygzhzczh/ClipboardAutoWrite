@@ -12,9 +12,12 @@ Windows 剪贴板自动保存工具。常驻后台监听剪贴板变化，自动
 
 ## 使用方法
 
-1. 下载 `clipboard_autowrite.exe`
-2. 双击运行即可，无需安装
-3. 复制任意文本，内容会自动保存到 exe 同级目录下的 `Clipboard<日期>.txt`
+1. 下载 `clipboard_autowrite.exe` 和 `setup_autostart.bat`，两个文件放到**同一个目录**
+2. 双击 `setup_autostart.bat` 开启开机自启动（写入注册表 + 创建计划任务）
+3. 双击 `clipboard_autowrite.exe` 开始监听
+4. 复制任意文本，内容会自动保存到 exe 同级目录下的 `Clipboard<日期>.txt`
+
+> 两个文件必须在同一目录，否则自启动脚本无法找到 exe。
 
 ## 构建
 

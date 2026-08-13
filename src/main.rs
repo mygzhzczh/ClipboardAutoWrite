@@ -1,0 +1,369 @@
+#![windows_subsystem = "windows"]
+
+use std::ffi::c_void;
+use std::fs;
+use std::mem::MaybeUninit;
+use std::os::windows::process::CommandExt;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+type HWND = isize;
+type WPARAM = usize;
+type LPARAM = isize;
+type LRESULT = isize;
+type HINSTANCE = isize;
+type HGLOBAL = isize;
+type HBRUSH = isize;
+type LPCWSTR = *const u16;
+
+const WM_DESTROY: u32 = 2;
+const WM_CLIPBOARDUPDATE: u32 = 0x031D;
+const WM_POWERBROADCAST: u32 = 0x218;
+const PBT_APMRESUMESUSPEND: u32 = 7;
+const PBT_APMRESUMEAUTOMATIC: u32 = 18;
+const CF_UNICODETEXT: u32 = 13;
+const CS_HREDRAW: u32 = 2;
+const CS_VREDRAW: u32 = 1;
+
+#[repr(C)]
+struct WNDCLASSW {
+    style: u32,
+    lpfnWndProc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+    cbClsExtra: i32,
+    cbWndExtra: i32,
+    hInstance: HINSTANCE,
+    hIcon: isize,
+    hCursor: isize,
+    hbrBackground: HBRUSH,
+    lpszMenuName: LPCWSTR,
+    lpszClassName: LPCWSTR,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct MSG {
+    hwnd: HWND,
+    message: u32,
+    wParam: WPARAM,
+    lParam: LPARAM,
+    time: u32,
+    pt: (i32, i32),
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct SYSTEMTIME {
+    wYear: u16,
+    wMonth: u16,
+    wDayOfWeek: u16,
+    wDay: u16,
+    wHour: u16,
+    wMinute: u16,
+    wSecond: u16,
+    wMilliseconds: u16,
+}
+
+static LAST_CLIP: Mutex<Option<String>> = Mutex::new(None);
+static PROCESSING: AtomicBool = AtomicBool::new(false);
+
+#[link(name = "user32")]
+extern "system" {
+    fn RegisterClassW(wnd: *const WNDCLASSW) -> u16;
+    fn CreateWindowExW(
+        ex_style: u32, cls: LPCWSTR, title: LPCWSTR, style: u32,
+        x: i32, y: i32, w: i32, h: i32,
+        parent: HWND, menu: isize, inst: HINSTANCE, param: *mut c_void,
+    ) -> HWND;
+    fn DefWindowProcW(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT;
+    fn DispatchMessageW(msg: *const MSG) -> LRESULT;
+    fn GetMessageW(msg: *mut MSG, hwnd: HWND, min: u32, max: u32) -> i32;
+    fn PostQuitMessage(code: i32);
+    fn TranslateMessage(msg: *const MSG) -> i32;
+    fn GetModuleHandleW(name: LPCWSTR) -> HINSTANCE;
+    fn AddClipboardFormatListener(hwnd: HWND) -> i32;
+    fn RemoveClipboardFormatListener(hwnd: HWND) -> i32;
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetLocalTime(st: *mut SYSTEMTIME);
+    fn GlobalLock(hmem: HGLOBAL) -> *mut c_void;
+    fn GlobalUnlock(hmem: HGLOBAL) -> i32;
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn OpenClipboard(hwnd: HWND) -> i32;
+    fn CloseClipboard() -> i32;
+    fn IsClipboardFormatAvailable(fmt: u32) -> i32;
+    fn GetClipboardData(fmt: u32) -> HGLOBAL;
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn get_save_dir() -> PathBuf {
+    std::env::current_exe()
+        .map(|p| p.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf())
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn get_today_string() -> String {
+    unsafe {
+        let mut st = MaybeUninit::<SYSTEMTIME>::uninit();
+        GetLocalTime(st.as_mut_ptr());
+        let st = st.assume_init();
+        format!("{:04}{:02}{:02}", st.wYear, st.wMonth, st.wDay)
+    }
+}
+
+fn get_time_string() -> String {
+    unsafe {
+        let mut st = MaybeUninit::<SYSTEMTIME>::uninit();
+        GetLocalTime(st.as_mut_ptr());
+        let st = st.assume_init();
+        format!(
+            "{:04}\u{5E74}{:02}\u{6708}{:02}\u{65E5} {:02}\u{65F6}{:02}\u{5206}{:02}\u{79D2}",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+        )
+    }
+}
+
+fn save_to_file(path: &PathBuf, tm: &str, text: &str) -> std::io::Result<()> {
+    let sep = "\u{2550}".repeat(22);
+    let old = fs::read_to_string(path).unwrap_or_default();
+    let new_block = format!("{}\r\n{}\r\n\r\n{}\r\n\r\n", tm, text, sep);
+    let content = format!("{}{}", new_block, old);
+    fs::write(path, content.as_bytes())
+}
+
+fn process_clipboard() {
+    if PROCESSING.load(Ordering::Relaxed) {
+        return;
+    }
+    PROCESSING.store(true, Ordering::Relaxed);
+
+    let _ = (|| -> std::result::Result<(), String> {
+        unsafe {
+            if OpenClipboard(0) == 0 { return Ok(()); }
+            if IsClipboardFormatAvailable(CF_UNICODETEXT) == 0 { CloseClipboard(); return Ok(()); }
+
+            let handle = GetClipboardData(CF_UNICODETEXT);
+            if handle == 0 { CloseClipboard(); return Ok(()); }
+
+            let ptr = GlobalLock(handle);
+            if ptr.is_null() { CloseClipboard(); return Ok(()); }
+
+            let mut len: usize = 0;
+            while *(ptr as *const u16).add(len) != 0 { len += 1; }
+            let slice = std::slice::from_raw_parts(ptr as *const u16, len);
+            let text = String::from_utf16_lossy(slice);
+            GlobalUnlock(handle);
+            CloseClipboard();
+
+            {
+                let mut last = LAST_CLIP.lock().unwrap();
+                if let Some(ref prev) = *last {
+                    if prev == &text { return Ok(()); }
+                }
+                *last = Some(text.clone());
+            }
+
+            let tm = get_time_string();
+            let today = get_today_string();
+            let mut path = get_save_dir();
+            path.push(format!("Clipboard{}.txt", today));
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            save_to_file(&path, &tm, &text).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })();
+
+    PROCESSING.store(false, Ordering::Relaxed);
+}
+
+unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_CLIPBOARDUPDATE => {
+            process_clipboard();
+            0
+        }
+        WM_POWERBROADCAST => {
+            let event = wparam as u32;
+            if event == PBT_APMRESUMESUSPEND || event == PBT_APMRESUMEAUTOMATIC {
+                AddClipboardFormatListener(hwnd);
+            }
+            1
+        }
+        WM_DESTROY => {
+            RemoveClipboardFormatListener(hwnd);
+            PostQuitMessage(0);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Check if running with admin privileges
+fn is_elevated() -> bool {
+    let output = Command::new("net").arg("session")
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match output {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).contains("\\\\"),
+        Err(_) => false,
+    }
+}
+
+/// Write registry auto-start entry (no admin needed)
+fn setup_registry(exe_str: &str) {
+    let mut cmd = Command::new("reg");
+    cmd.arg("add");
+    cmd.arg(r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run");
+    cmd.arg("/v");
+    cmd.arg("ClipboardAutoWrite");
+    cmd.arg("/t");
+    cmd.arg("REG_SZ");
+    cmd.arg("/d");
+    cmd.arg(exe_str);
+    cmd.arg("/f");
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let _ = cmd.output();
+}
+
+/// Create scheduled task with restart-on-failure (requires admin)
+fn setup_task(exe_str: &str) {
+    // Delete old task first
+    let mut del = Command::new("schtasks");
+    del.arg("/delete");
+    del.arg("/tn");
+    del.arg("ClipboardAutoWrite_Wake");
+    del.arg("/f");
+    del.creation_flags(CREATE_NO_WINDOW);
+    let _ = del.output();
+
+    // Build XML with restart-on-failure settings
+    let xml_content = format!(
+r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Clipboard Auto Write - restart on failure</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{escaped}</Command>
+    </Exec>
+  </Actions>
+</Task>"#,
+        escaped = exe_str.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    );
+
+    let tmp_dir = std::env::temp_dir();
+    let xml_path = tmp_dir.join("clipboard_task.xml");
+    let _ = fs::write(&xml_path, xml_content);
+
+    let mut create = Command::new("schtasks");
+    create.arg("/create");
+    create.arg("/tn");
+    create.arg("ClipboardAutoWrite_Wake");
+    create.arg("/xml");
+    create.arg(xml_path.to_string_lossy().as_ref());
+    create.arg("/f");
+    create.creation_flags(CREATE_NO_WINDOW);
+    let _ = create.output();
+
+    let _ = fs::remove_file(&xml_path);
+}
+
+fn setup_autostart() {
+    let exe_path = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let exe_str = exe_path.to_string_lossy().to_string();
+
+    // Always write registry (no admin needed)
+    setup_registry(&exe_str);
+
+    // Only create scheduled task if running as admin
+    if is_elevated() {
+        setup_task(&exe_str);
+    }
+}
+
+fn main() {
+    unsafe {
+        let inst = GetModuleHandleW(std::ptr::null());
+        let class_name = wide("ClipboardAutoWriteClass");
+        let window_name = wide("ClipboardAutoWrite");
+
+        let wc = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: wnd_proc,
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: inst,
+            hIcon: 0,
+            hCursor: 0,
+            hbrBackground: 0,
+            lpszMenuName: std::ptr::null(),
+            lpszClassName: class_name.as_ptr(),
+        };
+
+        RegisterClassW(&wc);
+
+        let hwnd = CreateWindowExW(
+            0, class_name.as_ptr(), window_name.as_ptr(), 0,
+            0, 0, 0, 0, 0, 0, inst, std::ptr::null_mut(),
+        );
+
+        if hwnd == 0 { return; }
+
+        AddClipboardFormatListener(hwnd);
+        setup_autostart();
+
+        let mut msg = MaybeUninit::<MSG>::uninit();
+        while GetMessageW(msg.as_mut_ptr(), 0, 0, 0) != 0 {
+            TranslateMessage(&*msg.as_ptr());
+            DispatchMessageW(msg.as_ptr());
+        }
+    }
+}

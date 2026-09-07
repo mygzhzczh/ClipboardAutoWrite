@@ -28,6 +28,9 @@ const PBT_APMRESUMEAUTOMATIC: u32 = 18;
 const CF_UNICODETEXT: u32 = 13;
 const CS_HREDRAW: u32 = 2;
 const CS_VREDRAW: u32 = 1;
+const WM_CREATE: u32 = 0x0001;
+const WM_TIMER: u32 = 0x0113;
+const ID_TIMER_FLUSH: usize = 1; // 异步刷盘定时器 ID
 
 #[repr(C)]
 struct WNDCLASSW {
@@ -69,6 +72,11 @@ struct SYSTEMTIME {
 
 static LAST_CLIP: Mutex<Option<String>> = Mutex::new(None);
 static PROCESSING: AtomicBool = AtomicBool::new(false);
+/// 待写入文件的队列: (日期字符串, 时间字符串, 剪切板内容)
+/// 每条记录复制时的日期,即使刷盘跨日也能写入正确日期对应的文件
+static PENDING: Mutex<Vec<(String, String, String)>> = Mutex::new(Vec::new());
+/// 刷盘防重入标志(TIMER 触发时用;WM_DESTROY 退出时忽略,强制 flush)
+static FLUSHING: AtomicBool = AtomicBool::new(false);
 
 #[link(name = "user32")]
 extern "system" {
@@ -86,6 +94,8 @@ extern "system" {
     fn GetModuleHandleW(name: LPCWSTR) -> HINSTANCE;
     fn AddClipboardFormatListener(hwnd: HWND) -> i32;
     fn RemoveClipboardFormatListener(hwnd: HWND) -> i32;
+    fn SetTimer(hwnd: HWND, id_event: usize, elapse: u32, timerproc: *const c_void) -> usize;
+    fn KillTimer(hwnd: HWND, id_event: usize) -> i32;
 }
 
 #[link(name = "kernel32")]
@@ -150,7 +160,20 @@ fn process_clipboard() {
 
     let _ = (|| -> std::result::Result<(), String> {
         unsafe {
-            if OpenClipboard(0) == 0 { return Ok(()); }
+            // 多监听器共存:重试 10 次,每次睡 1ms 让出 CPU 给其他进程
+            // ClipboardAutoWrite 优先级高(要写文件),必须保证拿到锁
+            let mut opened = false;
+            let mut retries = 0u32;
+            while retries < 10 {
+                if OpenClipboard(0) != 0 {
+                    opened = true;
+                    break;
+                }
+                retries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if !opened { return Ok(()); }
+
             if IsClipboardFormatAvailable(CF_UNICODETEXT) == 0 { CloseClipboard(); return Ok(()); }
 
             let handle = GetClipboardData(CF_UNICODETEXT);
@@ -174,14 +197,14 @@ fn process_clipboard() {
                 *last = Some(text.clone());
             }
 
+            // 关键改动:不再立刻写文件!push 到内存队列,由 WM_TIMER 异步刷盘
+            // 日期和时间都在复制时记录,避免 500ms 刷盘延迟导致跨天写错文件
+            let td = get_today_string();
             let tm = get_time_string();
-            let today = get_today_string();
-            let mut path = get_save_dir();
-            path.push(format!("Clipboard{}.txt", today));
-            if let Some(parent) = path.parent() {
-                let _ = fs::create_dir_all(parent);
+            {
+                let mut queue = PENDING.lock().unwrap();
+                queue.push((td, tm, text));
             }
-            save_to_file(&path, &tm, &text).map_err(|e| e.to_string())?;
         }
         Ok(())
     })();
@@ -189,8 +212,78 @@ fn process_clipboard() {
     PROCESSING.store(false, Ordering::Relaxed);
 }
 
+/// 将 PENDING 队列中的内容按复制日期分组后批量写入文件
+/// ignore_flushing: 是否忽略 FLUSHING 防重入(WM_DESTROY 退出时传 true,确保最后一批不丢)
+fn flush_pending(ignore_flushing: bool) {
+    if !ignore_flushing {
+        // 正常 TIMER 触发:防重入,上一次还没写完就跳过(500ms 后下一次再刷)
+        if FLUSHING.swap(true, Ordering::Relaxed) {
+            return;
+        }
+    } else {
+        // 退出时:如果刚好在 flush,等它完成(最多等 500ms),避免重复写
+        let mut waited = 0u32;
+        while FLUSHING.load(Ordering::Relaxed) && waited < 50 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            waited += 1;
+        }
+        FLUSHING.store(true, Ordering::Relaxed);
+    }
+
+    let items: Vec<(String, String, String)> = {
+        let mut queue = match PENDING.lock() {
+            Ok(g) => g,
+            Err(_) => { FLUSHING.store(false, Ordering::Relaxed); return; }
+        };
+        if queue.is_empty() {
+            drop(queue);
+            FLUSHING.store(false, Ordering::Relaxed);
+            return;
+        }
+        // 一次性 drain 所有待写项,尽快释放 Mutex 避免阻塞后续 push
+        queue.drain(..).collect()
+    };
+
+    // 按复制日期分组,分别写入对应日期的 ClipboardYYYYMMDD.txt
+    // 解决 23:59 复制、00:00 才刷盘导致昨天内容写进今天文件的问题
+    // 以及 500ms 内批量复制跨 0 点混合队列的问题
+    use std::collections::BTreeMap;
+    let mut by_day: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for (td, tm, text) in items {
+        by_day.entry(td).or_default().push((tm, text));
+    }
+
+    let save_dir = get_save_dir();
+    let dir: PathBuf = save_dir.canonicalize().unwrap_or(save_dir.clone());
+    {
+        let _ = fs::create_dir_all(&dir);
+        for (td, entries) in by_day {
+            let mut path = dir.clone();
+            path.push(format!("Clipboard{}.txt", td));
+            for (tm, text) in entries {
+                let _ = save_to_file(&path, &tm, &text);
+            }
+        }
+    }
+
+    FLUSHING.store(false, Ordering::Relaxed);
+}
+
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        WM_CREATE => {
+            // 500ms 定时器:异步刷盘 PENDING 队列
+            // 这样 WM_CLIPBOARDUPDATE 只负责读剪切板+入队,最快速度释放锁
+            let _ = SetTimer(hwnd, ID_TIMER_FLUSH, 500, std::ptr::null());
+            0
+        }
+        WM_TIMER => {
+            if wparam == ID_TIMER_FLUSH {
+                flush_pending(false);
+                return 0;
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_CLIPBOARDUPDATE => {
             process_clipboard();
             0
@@ -203,6 +296,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             1
         }
         WM_DESTROY => {
+            // ignore_flushing=true:强制 flush 残留内容,最多等 500ms;保证退出前不丢数据
+            flush_pending(true);
+            let _ = KillTimer(hwnd, ID_TIMER_FLUSH);
             RemoveClipboardFormatListener(hwnd);
             PostQuitMessage(0);
             0
